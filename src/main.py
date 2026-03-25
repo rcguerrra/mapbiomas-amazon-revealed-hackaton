@@ -5,14 +5,14 @@ import pandas as pd
 import plotly.graph_objects as go
 import rasterio
 import streamlit as st
+import streamlit.components.v1 as components
 
-PARQUET = "./data/ACRE_005_NP_8973-536.parquet"
 SCALE = 0.001  # LAS default scale factor
 
 st.set_page_config(page_title="LiDAR Explorer", layout="wide")
 st.title("LiDAR Explorer — ACRE")
 
-tab_3d, tab_tif = st.tabs(["Nuvem de pontos 3D", "GeoTIFF"])
+tab_3d, tab_tif, tab_map = st.tabs(["Nuvem de pontos 3D", "GeoTIFF", "MapLibre"])
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -45,10 +45,15 @@ def load_tif(path: str):
 # ABA 1 — Nuvem de pontos 3D
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_3d:
-    df_full = load_parquet(PARQUET)
+    parquet_files = sorted(glob.glob("./data/*.parquet"))
+    if not parquet_files:
+        st.info("Nenhum arquivo .parquet encontrado em data/.")
+        st.stop()
 
     with st.sidebar:
         st.header("Visualização 3D")
+        selected_parquet = st.selectbox("Arquivo Parquet", parquet_files)
+        df_full = load_parquet(selected_parquet)
         n_points   = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
         color_by   = st.selectbox("Colorir por", ["z", "intensity", "classification", "return_number"])
         colorscale = st.selectbox("Paleta de cores", ["Viridis", "Plasma", "Inferno", "RdYlGn", "Turbo"])
@@ -148,3 +153,52 @@ with tab_tif:
             height=600,
         )
         st.plotly_chart(fig_tif, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ABA 3 — MapLibre
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_map:
+    st.subheader("Mapa base (Google Satélite)")
+    map_html = """
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link
+        href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
+        rel="stylesheet"
+      />
+      <style>
+        html, body, #map { margin: 0; height: 100%; width: 100%; }
+      </style>
+    </head>
+    <body>
+      <div id="map"></div>
+      <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+      <script>
+        const map = new maplibregl.Map({
+          container: 'map',
+          style: {
+            version: 8,
+            sources: {
+              'google-sat': {
+                type: 'raster',
+                tiles: ['https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}'],
+                tileSize: 256,
+                attribution: 'Google Satellite'
+              }
+            },
+            layers: [
+              { id: 'google-sat-layer', type: 'raster', source: 'google-sat' }
+            ]
+          },
+          center: [-55.0, -10.0],
+          zoom: 4
+        });
+      </script>
+    </body>
+    </html>
+    """
+    components.html(map_html, height=650)
