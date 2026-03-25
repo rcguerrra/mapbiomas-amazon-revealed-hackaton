@@ -1,4 +1,5 @@
 import glob
+import json
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,47 @@ def load_tif(path: str):
     if nodata is not None:
         band[band == nodata] = np.nan
     return band, bounds
+
+
+@st.cache_data
+def prepare_map_points(path: str, n_points: int, z_exaggeration: float) -> tuple[list[dict], float, float]:
+    df = load_parquet(path)
+    df = sample(df, n_points)
+
+    x = df["x"].astype(float).to_numpy()
+    y = df["y"].astype(float).to_numpy()
+    z = df["z"].astype(float).to_numpy()
+
+    # If coordinates are already geographic, use them directly.
+    is_geographic = (
+        np.nanmin(x) >= -180 and np.nanmax(x) <= 180 and np.nanmin(y) >= -90 and np.nanmax(y) <= 90
+    )
+
+    if is_geographic:
+        lon = x
+        lat = y
+    else:
+        # Fallback: treat XY as local metric coordinates and anchor in Acre.
+        lon0 = -67.8
+        lat0 = -9.8
+        dx = x - np.nanmean(x)
+        dy = y - np.nanmean(y)
+        lon = lon0 + (dx / (111320.0 * np.cos(np.radians(lat0))))
+        lat = lat0 + (dy / 110540.0)
+
+    zmin = float(np.nanmin(z))
+    zmax = float(np.nanmax(z))
+    span = max(zmax - zmin, 1e-9)
+    zn = (z - zmin) / span
+
+    points = [
+        {
+            "position": [float(lon_i), float(lat_i), float((z_i - zmin) * z_exaggeration)],
+            "color": [int(255 * zn_i), int(160 * (1 - zn_i)), int(255 * (1 - zn_i)), 180],
+        }
+        for lon_i, lat_i, z_i, zn_i in zip(lon, lat, z, zn)
+    ]
+    return points, float(np.nanmean(lon)), float(np.nanmean(lat))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -159,7 +201,16 @@ with tab_tif:
 # ABA 3 — MapLibre
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_map:
-    st.subheader("Mapa base (Google Satélite)")
+    st.subheader("Mapa base (Google Satélite) + pontos 3D")
+    col1, col2 = st.columns(2)
+    with col1:
+        map_points_n = st.slider("Pontos no mapa", 2_000, 60_000, 15_000, step=1_000, key="map_points_n")
+    with col2:
+        z_exaggeration = st.slider("Exagero vertical", 0.2, 8.0, 2.0, step=0.2, key="map_z_ex")
+
+    points, center_lon, center_lat = prepare_map_points(selected_parquet, map_points_n, z_exaggeration)
+    points_json = json.dumps(points)
+
     map_html = """
     <!doctype html>
     <html>
@@ -177,6 +228,8 @@ with tab_map:
     <body>
       <div id="map"></div>
       <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+      <script src="https://unpkg.com/deck.gl@8.9.36/dist.min.js"></script>
+      <script src="https://unpkg.com/@deck.gl/mapbox@8.9.36/dist.min.js"></script>
       <script>
         const map = new maplibregl.Map({
           container: 'map',
@@ -194,11 +247,37 @@ with tab_map:
               { id: 'google-sat-layer', type: 'raster', source: 'google-sat' }
             ]
           },
-          center: [-55.0, -10.0],
-          zoom: 4
+          center: [__CENTER_LON__, __CENTER_LAT__],
+          zoom: 12,
+          pitch: 55,
+          bearing: -15
+        });
+
+        const pointCloudLayer = new deck.PointCloudLayer({
+          id: 'lidar-point-cloud',
+          data: __POINTS_JSON__,
+          getPosition: d => d.position,
+          getColor: d => d.color,
+          pointSize: 0.8,
+          coordinateSystem: deck.COORDINATE_SYSTEM.LNGLAT,
+          pickable: false
+        });
+
+        map.on('load', () => {
+          const overlay = new deck.MapboxOverlay({
+            interleaved: true,
+            layers: [pointCloudLayer]
+          });
+          map.addControl(overlay);
         });
       </script>
     </body>
     </html>
     """
+    map_html = (
+        map_html
+        .replace("__POINTS_JSON__", points_json)
+        .replace("__CENTER_LON__", str(center_lon))
+        .replace("__CENTER_LAT__", str(center_lat))
+    )
     components.html(map_html, height=650)
