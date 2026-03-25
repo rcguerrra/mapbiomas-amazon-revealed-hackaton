@@ -9,3 +9,8 @@ boto3
 s3fs
 gcsfs
 google-cloud-storage
+laspy
+lazrs
+pyarrow
+streamlit
+plotly

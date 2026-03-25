@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -33,6 +34,12 @@ def _build_client(
         aws_secret=aws_secret,
         aws_region=aws_region,
     )
+
+
+def _normalize_path(path: str) -> str:
+    if path.startswith("gcs://"):
+        return "gs://" + path[len("gcs://") :]
+    return path
 
 
 @app.command(help="Show resolved credential sources for StorageClient.")
@@ -88,46 +95,32 @@ def check_access(
     result = client.check_access(path)
     console.print(result)
 
-
-@app.command(help="Read text content from a file.")
-def read_text(
-    file_path: str = typer.Argument(..., help="File path (local, s3://, gcs://)."),
-    max_chars: int = typer.Option(5000, "--max-chars", help="Maximum chars to print."),
+@app.command(help="Download file from storage (s3:// or gs://) to local path.")
+def download(
+    source_path: str = typer.Argument(..., help="Source path (s3://, gs://, gcs://, or local)."),
+    destination_path: Optional[str] = typer.Argument(
+        None, help="Local destination path. Defaults to data/<source filename>."
+    ),
     credentials_path: Optional[str] = typer.Option(None, "--credentials-path", "-c"),
     aws_key_id: Optional[str] = typer.Option(None, "--aws-key-id"),
     aws_secret: Optional[str] = typer.Option(None, "--aws-secret"),
     aws_region: Optional[str] = typer.Option(None, "--aws-region"),
 ):
     client = _build_client(credentials_path, aws_key_id, aws_secret, aws_region)
-    text = client.read_text(file_path)
-    console.print(text[:max_chars])
+    source_path = _normalize_path(source_path)
 
-
-@app.command(help="Save text content to a path.")
-def save_text(
-    file_path: str = typer.Argument(..., help="Destination file path."),
-    content: str = typer.Argument(..., help="Text content to save."),
-    credentials_path: Optional[str] = typer.Option(None, "--credentials-path", "-c"),
-    aws_key_id: Optional[str] = typer.Option(None, "--aws-key-id"),
-    aws_secret: Optional[str] = typer.Option(None, "--aws-secret"),
-    aws_region: Optional[str] = typer.Option(None, "--aws-region"),
-):
-    client = _build_client(credentials_path, aws_key_id, aws_secret, aws_region)
-    client.save_text(content, file_path)
-    console.print(f"[green]Saved:[/green] {file_path}")
-
-
-@app.command(help="Make remote object public and return URL when supported.")
-def make_public(
-    file_path: str = typer.Argument(..., help="Path must be s3:// or gcs://."),
-    credentials_path: Optional[str] = typer.Option(None, "--credentials-path", "-c"),
-    aws_key_id: Optional[str] = typer.Option(None, "--aws-key-id"),
-    aws_secret: Optional[str] = typer.Option(None, "--aws-secret"),
-    aws_region: Optional[str] = typer.Option(None, "--aws-region"),
-):
-    client = _build_client(credentials_path, aws_key_id, aws_secret, aws_region)
-    url = client.make_public(file_path)
-    if url:
-        console.print(f"[green]{url}[/green]")
+    if destination_path:
+        destination = Path(destination_path)
     else:
-        console.print("[yellow]Not supported for this path.[/yellow]")
+        source_name = Path(source_path).name
+        if not source_name:
+            raise typer.BadParameter(
+                "Could not infer filename from source_path. Provide destination_path explicitly."
+            )
+        destination = Path("data") / source_name
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    content = client.read(source_path)
+    destination.write_bytes(content)
+    console.print(f"[green]Downloaded:[/green] {source_path} -> {destination}")
