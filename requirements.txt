@@ -14,3 +14,4 @@ lazrs
 pyarrow
 streamlit
 plotly
+rasterio
