@@ -1,9 +1,11 @@
 import glob
 import json
+import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly import colors as pcolors
 import rasterio
 import streamlit as st
 import streamlit.components.v1 as components
@@ -13,7 +15,7 @@ SCALE = 0.001  # LAS default scale factor
 st.set_page_config(page_title="LiDAR Explorer", layout="wide")
 st.title("LiDAR Explorer — ACRE")
 
-tab_3d, tab_tif, tab_map = st.tabs(["Nuvem de pontos 3D", "GeoTIFF", "MapLibre"])
+tab_3d, tab_map = st.tabs(["Nuvem de pontos 3D", "MapLibre"])
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,10 +45,9 @@ def load_tif(path: str):
 
 
 @st.cache_data
-def prepare_map_points(path: str, n_points: int, z_exaggeration: float) -> tuple[list[dict], float, float]:
-    df = load_parquet(path)
-    df = sample(df, n_points)
-
+def prepare_map_points(
+    df: pd.DataFrame, color_by: str, colorscale: str, z_exaggeration: float
+) -> tuple[list[dict], float, float]:
     x = df["x"].astype(float).to_numpy()
     y = df["y"].astype(float).to_numpy()
     z = df["z"].astype(float).to_numpy()
@@ -69,16 +70,26 @@ def prepare_map_points(path: str, n_points: int, z_exaggeration: float) -> tuple
         lat = lat0 + (dy / 110540.0)
 
     zmin = float(np.nanmin(z))
-    zmax = float(np.nanmax(z))
-    span = max(zmax - zmin, 1e-9)
-    zn = (z - zmin) / span
+
+    c = df[color_by].astype(float).to_numpy()
+    cmin = float(np.nanmin(c))
+    cmax = float(np.nanmax(c))
+    cspan = max(cmax - cmin, 1e-9)
+    cn = (c - cmin) / cspan
+
+    sampled_colors = pcolors.sample_colorscale(colorscale, cn.tolist())
+
+    def _rgba_from_plotly(color: str) -> list[int]:
+        match = re.findall(r"[\d\.]+", color)
+        r, g, b = [int(float(v)) for v in match[:3]]
+        return [r, g, b, 180]
 
     points = [
         {
             "position": [float(lon_i), float(lat_i), float((z_i - zmin) * z_exaggeration)],
-            "color": [int(255 * zn_i), int(160 * (1 - zn_i)), int(255 * (1 - zn_i)), 180],
+            "color": _rgba_from_plotly(color_i),
         }
-        for lon_i, lat_i, z_i, zn_i in zip(lon, lat, z, zn)
+        for lon_i, lat_i, z_i, color_i in zip(lon, lat, z, sampled_colors)
     ]
     return points, float(np.nanmean(lon)), float(np.nanmean(lat))
 
@@ -160,41 +171,41 @@ with tab_3d:
             st.bar_chart(df["classification"].value_counts().sort_index())
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ABA 2 — GeoTIFF
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_tif:
-    tif_files = sorted(glob.glob("./data/*.tif"))
-
-    if not tif_files:
-        st.info("Nenhum GeoTIFF encontrado em data/. Gere um com:\n\n"
-                "`python -m src.console lidar parquet-to-tif data/<file>.parquet`")
-    else:
-        selected_tif = st.selectbox("Arquivo GeoTIFF", tif_files)
-        tif_colorscale = st.selectbox("Paleta", ["Viridis", "Plasma", "Inferno", "RdYlGn", "Turbo"], key="tif_cs")
-
-        band, bounds = load_tif(selected_tif)
-
-        c1, c2, c3, c4 = st.columns(4)
-        valid = band[~np.isnan(band)]
-        c1.metric("Linhas × Colunas", f"{band.shape[0]} × {band.shape[1]}")
-        c2.metric("Mín", f"{valid.min():.2f}" if len(valid) else "—")
-        c3.metric("Máx", f"{valid.max():.2f}" if len(valid) else "—")
-        c4.metric("Média", f"{valid.mean():.2f}" if len(valid) else "—")
-
-        fig_tif = go.Figure(go.Heatmap(
-            z=band,
-            colorscale=tif_colorscale,
-            colorbar=dict(title="valor"),
-            hoverongaps=False,
-        ))
-        fig_tif.update_layout(
-            xaxis=dict(title="coluna", scaleanchor="y"),
-            yaxis=dict(title="linha", autorange="reversed"),
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=600,
-        )
-        st.plotly_chart(fig_tif, use_container_width=True)
+# # ══════════════════════════════════════════════════════════════════════════════
+# # ABA 2 — GeoTIFF (desativada)
+# # ══════════════════════════════════════════════════════════════════════════════
+# with tab_tif:
+#     tif_files = sorted(glob.glob("./data/*.tif"))
+#
+#     if not tif_files:
+#         st.info("Nenhum GeoTIFF encontrado em data/. Gere um com:\n\n"
+#                 "`python -m src.console lidar parquet-to-tif data/<file>.parquet`")
+#     else:
+#         selected_tif = st.selectbox("Arquivo GeoTIFF", tif_files)
+#         tif_colorscale = st.selectbox("Paleta", ["Viridis", "Plasma", "Inferno", "RdYlGn", "Turbo"], key="tif_cs")
+#
+#         band, bounds = load_tif(selected_tif)
+#
+#         c1, c2, c3, c4 = st.columns(4)
+#         valid = band[~np.isnan(band)]
+#         c1.metric("Linhas × Colunas", f"{band.shape[0]} × {band.shape[1]}")
+#         c2.metric("Mín", f"{valid.min():.2f}" if len(valid) else "—")
+#         c3.metric("Máx", f"{valid.max():.2f}" if len(valid) else "—")
+#         c4.metric("Média", f"{valid.mean():.2f}" if len(valid) else "—")
+#
+#         fig_tif = go.Figure(go.Heatmap(
+#             z=band,
+#             colorscale=tif_colorscale,
+#             colorbar=dict(title="valor"),
+#             hoverongaps=False,
+#         ))
+#         fig_tif.update_layout(
+#             xaxis=dict(title="coluna", scaleanchor="y"),
+#             yaxis=dict(title="linha", autorange="reversed"),
+#             margin=dict(l=0, r=0, t=0, b=0),
+#             height=600,
+#         )
+#         st.plotly_chart(fig_tif, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -202,13 +213,14 @@ with tab_tif:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_map:
     st.subheader("Mapa base (Google Satélite) + pontos 3D")
-    col1, col2 = st.columns(2)
-    with col1:
-        map_points_n = st.slider("Pontos no mapa", 2_000, 60_000, 15_000, step=1_000, key="map_points_n")
-    with col2:
-        z_exaggeration = st.slider("Exagero vertical", 0.2, 8.0, 2.0, step=0.2, key="map_z_ex")
+    z_exaggeration = st.slider("Exagero vertical", 0.2, 8.0, 2.0, step=0.2, key="map_z_ex")
+    st.caption(f"Usando {n_points:,} pontos (controle 'Pontos amostrados' da barra lateral).")
 
-    points, center_lon, center_lat = prepare_map_points(selected_parquet, map_points_n, z_exaggeration)
+    if df.empty:
+        st.warning("Nenhum ponto para desenhar no mapa com os filtros atuais.")
+        st.stop()
+
+    points, center_lon, center_lat = prepare_map_points(df, color_by, colorscale, z_exaggeration)
     points_json = json.dumps(points)
 
     map_html = """
