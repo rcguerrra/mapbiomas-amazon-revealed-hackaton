@@ -1,0 +1,11 @@
+python-dotenv
+typer
+rich
+pandas
+tabulate
+earthengine-api
+fsspec
+boto3
+s3fs
+gcsfs
+google-cloud-storage
