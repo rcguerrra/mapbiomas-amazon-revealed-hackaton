@@ -1,4 +1,3 @@
-import glob
 import json
 import os
 import re
@@ -16,12 +15,14 @@ from config import load_gcp_service_account_dict
 from lidar import laz_to_parquet
 from utils.storage_client import StorageClient
 
-BQ_PROJECT = "mapbiomas"
-BQ_TABLE = "mapbiomas.mapbiomas_lidar.amazonia_3d"
-
 DEFAULT_LIDAR_LAZ_URI = (
-    "gs://amazon-revealed/Point-Cloud/01_ENTREGA_23_08_2023/NP/ACRE_005_NP_8973-536.laz"
+    "gs://amazon-revealed/Point-Cloud/01_ENTREGA_23_08_2023/NP/ACRE_005_NP_8976-536.laz"
 )
+
+POINT_CLOUD_LIST_PREFIX_GS = "gs://amazon-revealed/Point-Cloud"
+POINT_CLOUD_MIN_LAZ_BYTES = 50 * 1024 * 1024
+POINT_CLOUD_MAX_LAZ_BYTES = 100 * 1024 * 1024
+POINT_CLOUD_LIST_LIMIT = 100
 
 load_dotenv()
 
@@ -38,7 +39,12 @@ def _sync_streamlit_secrets_to_environ() -> None:
             ):
                 if key in st.secrets:
                     value = st.secrets[key]
-                    os.environ[key] = json.dumps(value) if isinstance(value, dict) else str(value)
+                    if isinstance(value, dict):
+                        os.environ[key] = json.dumps(value, ensure_ascii=False)
+                    elif isinstance(value, str):
+                        os.environ[key] = value
+                    else:
+                        os.environ[key] = json.dumps(value, ensure_ascii=False)
     except Exception:
         pass
 
@@ -105,6 +111,76 @@ def ensure_local_parquet_from_remote_laz(
     return local_parquet
 
 
+@st.cache_data(ttl=600, show_spinner="Listing Point-Cloud objects…")
+def list_point_cloud_laz_catalog() -> list[tuple[str, int]]:
+    client = _build_storage_client()
+    return client.list_gcs_files_filtered(
+        POINT_CLOUD_LIST_PREFIX_GS,
+        min_size_bytes=POINT_CLOUD_MIN_LAZ_BYTES,
+        max_size_bytes=POINT_CLOUD_MAX_LAZ_BYTES,
+        suffixes=(".laz", ".las"),
+        sort_descending=True,
+        limit=POINT_CLOUD_LIST_LIMIT,
+    )
+
+
+def _format_size_mb(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+
+def _df_from_remote_laz_pipeline(
+    laz_uri: str,
+    *,
+    load_laz_clicked: bool,
+    force_laz_sync: bool,
+) -> tuple[pd.DataFrame, str]:
+    if not laz_uri.strip():
+        st.info("Selecione ou informe a URI do arquivo .laz na storage (gs:// ou s3://).")
+        st.stop()
+
+    uri_norm = _normalize_storage_path(laz_uri.strip())
+    loaded_uri = st.session_state.get("laz_loaded_uri_norm")
+    parquet_cached = st.session_state.get("laz_storage_parquet_path")
+
+    if loaded_uri != uri_norm and not load_laz_clicked:
+        st.info(
+            "Clique em **Carregar arquivo** para baixar da storage e converter para Parquet."
+        )
+        st.stop()
+
+    reuse_local_parquet = (
+        loaded_uri == uri_norm
+        and parquet_cached
+        and Path(parquet_cached).is_file()
+        and not force_laz_sync
+        and not load_laz_clicked
+    )
+
+    if reuse_local_parquet:
+        parquet_path = Path(parquet_cached)
+    else:
+        try:
+            with st.spinner(
+                "Checking storage, downloading LAZ if needed, converting to Parquet…"
+            ):
+                parquet_path = ensure_local_parquet_from_remote_laz(
+                    laz_uri.strip(), force_download=force_laz_sync
+                )
+        except Exception as exc:
+            st.error(f"Erro ao sincronizar LAZ / Parquet: {exc}")
+            st.stop()
+        st.session_state["laz_loaded_uri_norm"] = uri_norm
+        st.session_state["laz_storage_parquet_path"] = str(parquet_path)
+
+    try:
+        df_full = load_parquet(str(parquet_path))
+    except Exception as exc:
+        st.error(f"Erro ao carregar Parquet: {exc}")
+        st.stop()
+    source_label = f"{uri_norm} → {parquet_path}"
+    return df_full, source_label
+
+
 def _standardize_point_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = {c.lower(): c for c in df.columns}
 
@@ -164,23 +240,6 @@ def sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
 
 
 @st.cache_data
-def load_bigquery_table(project: str, table: str, limit: int) -> pd.DataFrame:
-    from google.cloud import bigquery
-    from google.oauth2 import service_account
-
-    info = load_gcp_service_account_dict()
-    if info is not None:
-        creds = service_account.Credentials.from_service_account_info(info)
-        client = bigquery.Client(project=project, credentials=creds)
-    else:
-        client = bigquery.Client(project=project)
-    query = f"SELECT * FROM `{table}` LIMIT {int(limit)}"
-    df = client.query(query).result().to_dataframe()
-
-    return _standardize_point_columns(df)
-
-
-@st.cache_data
 def prepare_map_points(
     df: pd.DataFrame, color_by: str, colorscale: str, z_exaggeration: float
 ) -> tuple[list[dict], float, float]:
@@ -234,22 +293,57 @@ def prepare_map_points(
 # ABA 1 — Nuvem de pontos 3D
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_3d:
-    parquet_files = sorted(glob.glob("./data/*.parquet"))
-
     with st.sidebar:
         st.header("Visualização 3D")
         data_source = st.selectbox(
             "Fonte",
             [
-                "LAZ na Storage (download + Parquet)",
-                "Parquet local",
-                "Parquet na Storage (gs://, s3://)",
-                "BigQuery",
+                "Point-Cloud em gs://amazon-revealed (50–100 MB)",
+                "LAZ na Storage (URI manual)",
             ],
         )
         n_points = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
 
-        if data_source == "LAZ na Storage (download + Parquet)":
+        if data_source == "Point-Cloud em gs://amazon-revealed (50–100 MB)":
+            try:
+                entries = list_point_cloud_laz_catalog()
+            except Exception as exc:
+                st.error(f"Erro ao listar {POINT_CLOUD_LIST_PREFIX_GS}: {exc}")
+                st.stop()
+            if not entries:
+                st.warning(
+                    f"Nenhum arquivo .laz/.las entre 50 e 100 MB em {POINT_CLOUD_LIST_PREFIX_GS}/ "
+                    "(listagem recursiva)."
+                )
+                st.stop()
+            by_uri = dict(entries)
+            laz_uri = st.selectbox(
+                "Arquivo LAZ",
+                options=list(by_uri.keys()),
+                format_func=lambda u: f"{u.rsplit('/', 1)[-1]} — {_format_size_mb(by_uri[u])}",
+                help=(
+                    f"Até {POINT_CLOUD_LIST_LIMIT} arquivos entre 50 e 100 MB, "
+                    "do maior para o menor."
+                ),
+            )
+            force_laz_sync = st.checkbox(
+                "Force re-download and re-convert",
+                value=False,
+                help="Ignore cached local LAZ/Parquet for this URI and sync again from storage.",
+            )
+            load_laz_clicked = st.button(
+                "Carregar arquivo",
+                type="primary",
+                use_container_width=True,
+                key="load_laz_point_cloud",
+                help="Download from storage (if needed) and convert to Parquet before viewing.",
+            )
+            df_full, source_label = _df_from_remote_laz_pipeline(
+                laz_uri,
+                load_laz_clicked=load_laz_clicked,
+                force_laz_sync=force_laz_sync,
+            )
+        elif data_source == "LAZ na Storage (URI manual)":
             default_laz_uri = os.getenv("LIDAR_LAZ_URI", DEFAULT_LIDAR_LAZ_URI)
             laz_uri = st.text_input(
                 "URI do LAZ",
@@ -266,87 +360,14 @@ with tab_3d:
                 "Carregar arquivo",
                 type="primary",
                 use_container_width=True,
+                key="load_laz_manual_uri",
                 help="Download from storage (if needed) and convert to Parquet before viewing.",
             )
-            if not laz_uri:
-                st.info("Informe a URI do arquivo .laz na storage (gs:// ou s3://).")
-                st.stop()
-
-            uri_norm = _normalize_storage_path(laz_uri)
-            loaded_uri = st.session_state.get("laz_loaded_uri_norm")
-            parquet_cached = st.session_state.get("laz_storage_parquet_path")
-
-            if loaded_uri != uri_norm and not load_laz_clicked:
-                st.info(
-                    "Clique em **Carregar arquivo** para baixar da storage e converter para Parquet."
-                )
-                st.stop()
-
-            reuse_local_parquet = (
-                loaded_uri == uri_norm
-                and parquet_cached
-                and Path(parquet_cached).is_file()
-                and not force_laz_sync
-                and not load_laz_clicked
+            df_full, source_label = _df_from_remote_laz_pipeline(
+                laz_uri,
+                load_laz_clicked=load_laz_clicked,
+                force_laz_sync=force_laz_sync,
             )
-
-            if reuse_local_parquet:
-                parquet_path = Path(parquet_cached)
-            else:
-                try:
-                    with st.spinner(
-                        "Checking storage, downloading LAZ if needed, converting to Parquet…"
-                    ):
-                        parquet_path = ensure_local_parquet_from_remote_laz(
-                            laz_uri, force_download=force_laz_sync
-                        )
-                except Exception as exc:
-                    st.error(f"Erro ao sincronizar LAZ / Parquet: {exc}")
-                    st.stop()
-                st.session_state["laz_loaded_uri_norm"] = uri_norm
-                st.session_state["laz_storage_parquet_path"] = str(parquet_path)
-
-            try:
-                df_full = load_parquet(str(parquet_path))
-            except Exception as exc:
-                st.error(f"Erro ao carregar Parquet: {exc}")
-                st.stop()
-            source_label = f"{uri_norm} → {parquet_path}"
-        elif data_source == "Parquet local":
-            if not parquet_files:
-                st.info("Nenhum arquivo .parquet encontrado em data/.")
-                st.stop()
-            selected_parquet = st.selectbox("Arquivo Parquet", parquet_files)
-            try:
-                df_full = load_parquet(selected_parquet)
-            except Exception as exc:
-                st.error(f"Erro ao carregar Parquet local: {exc}")
-                st.stop()
-            source_label = selected_parquet
-        elif data_source == "Parquet na Storage (gs://, s3://)":
-            default_storage_uri = os.getenv("LIDAR_PARQUET_URI", "")
-            storage_parquet_uri = st.text_input(
-                "URI do Parquet",
-                value=default_storage_uri,
-                placeholder="gs://bucket/pasta/arquivo.parquet",
-                help="Suporta gs://, gcs:// e s3://.",
-            ).strip()
-            if not storage_parquet_uri:
-                st.info("Informe a URI do parquet na storage.")
-                st.stop()
-            try:
-                df_full = load_parquet(storage_parquet_uri)
-            except Exception as exc:
-                st.error(f"Erro ao carregar Parquet na storage: {exc}")
-                st.stop()
-            source_label = _normalize_storage_path(storage_parquet_uri)
-        else:
-            try:
-                df_full = load_bigquery_table(BQ_PROJECT, BQ_TABLE, n_points)
-            except Exception as exc:
-                st.error(f"Erro ao carregar BigQuery: {exc}")
-                st.stop()
-            source_label = f"{BQ_TABLE} (limit {n_points:,})"
 
         if df_full.empty:
             st.warning("A fonte selecionada não retornou dados.")

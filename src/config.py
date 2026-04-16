@@ -34,14 +34,34 @@ def _normalize_multiline_private_key(raw_json: str) -> str:
 
 
 def _parse_service_account_json(raw: str) -> Dict[str, Any]:
-    raw = raw.strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        normalized = _normalize_multiline_private_key(raw)
-        if normalized == raw:
-            raise exc
-        return json.loads(normalized)
+    """
+    Parse service-account JSON that may contain trailing garbage (duplicate JSON),
+    real newlines inside private_key, or be double-encoded as a JSON string.
+    """
+    raw = raw.strip().lstrip("\ufeff")
+    decoder = json.JSONDecoder()
+
+    def _first_object(payload: str) -> Any:
+        obj, end = decoder.raw_decode(payload)
+        # Trailing content after the first JSON value is ignored (duplicate paste, etc.).
+        _ = payload[end:].strip()
+        return obj
+
+    def _to_dict(payload: str) -> Dict[str, Any]:
+        try:
+            obj = _first_object(payload)
+        except json.JSONDecodeError:
+            normalized = _normalize_multiline_private_key(payload)
+            if normalized == payload:
+                raise
+            obj = _first_object(normalized)
+        if isinstance(obj, str) and obj.strip().startswith("{"):
+            obj = _first_object(obj.strip())
+        if not isinstance(obj, dict):
+            raise ValueError("GCP credentials must be a JSON object (service account).")
+        return obj
+
+    return _to_dict(raw)
 
 
 def load_gcp_service_account_dict() -> Optional[Dict[str, Any]]:

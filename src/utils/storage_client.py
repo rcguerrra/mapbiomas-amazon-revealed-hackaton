@@ -105,6 +105,66 @@ class StorageClient:
             logger.error(f"Erro ao listar diretório {dir_path}: {e}")
             raise
 
+    def list_gcs_files_filtered(
+        self,
+        gs_prefix: str,
+        *,
+        min_size_bytes: Optional[int] = None,
+        max_size_bytes: Optional[int] = None,
+        suffixes: Optional[tuple[str, ...]] = None,
+        sort_descending: bool = False,
+        limit: Optional[int] = None,
+    ) -> List[tuple[str, int]]:
+        """
+        Recursively list files under a gs:// prefix, optionally filtering by
+        inclusive size bounds, suffix, sort order, and max count.
+        Returns (gs:// URI, size).
+        """
+        if not gs_prefix.startswith("gs://"):
+            raise ValueError("gs_prefix must start with gs://")
+
+        fs = self._get_fs(gs_prefix)
+        prefix = gs_prefix[len("gs://") :].rstrip("/")
+        found = fs.find(prefix, detail=True)
+
+        if isinstance(found, dict):
+            items = list(found.items())
+        elif isinstance(found, list):
+            if not found:
+                items = []
+            elif isinstance(found[0], dict) and "name" in found[0]:
+                items = [(d["name"], d) for d in found]
+            else:
+                items = [(p, fs.info(p)) for p in found]
+        else:
+            items = []
+
+        results: List[tuple[str, int]] = []
+        suffixes_l = tuple(s.lower() for s in suffixes) if suffixes else None
+
+        for path, info in items:
+            if not isinstance(info, dict):
+                continue
+            if info.get("type") == "directory":
+                continue
+            size = int(info.get("size") or info.get("Size") or 0)
+            base = path.split("/")[-1]
+            if not base or base.endswith("/"):
+                continue
+            if suffixes_l and not base.lower().endswith(suffixes_l):
+                continue
+            if min_size_bytes is not None and size < min_size_bytes:
+                continue
+            if max_size_bytes is not None and size > max_size_bytes:
+                continue
+            gs_uri = path if path.startswith("gs://") else f"gs://{path}"
+            results.append((gs_uri, size))
+
+        results.sort(key=lambda x: x[1], reverse=sort_descending)
+        if limit is not None:
+            results = results[:limit]
+        return results
+
     def read(self, file_path: str) -> bytes:
         """
         Lê um arquivo binário.
