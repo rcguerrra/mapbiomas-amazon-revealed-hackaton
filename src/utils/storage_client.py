@@ -165,6 +165,17 @@ class StorageClient:
             results = results[:limit]
         return results
 
+    def gcs_object_size_bytes(self, gs_uri: str) -> int:
+        """Return blob size in bytes for a gs:// object."""
+        if not gs_uri.startswith("gs://"):
+            raise ValueError("gcs_object_size_bytes expects a gs:// URI.")
+        fs = self._get_fs(gs_uri)
+        path = gs_uri[len("gs://") :].lstrip("/")
+        info = fs.info(path)
+        if not isinstance(info, dict):
+            return 0
+        return int(info.get("size") or info.get("Size") or 0)
+
     def read(self, file_path: str) -> bytes:
         """
         Lê um arquivo binário.

@@ -16,8 +16,10 @@ from lidar import laz_to_parquet
 from utils.storage_client import StorageClient
 
 DEFAULT_LIDAR_LAZ_URI = (
-    "gs://amazon-revealed/Point-Cloud/01_ENTREGA_23_08_2023/NP/ACRE_005_NP_8976-536.laz"
+    "gs://amazon-revealed/Point-Cloud/32_ENTREGA_17-12-2024/NP/MARAJO_009_NP_9892-684.laz"
 )
+
+POINT_CLOUD_COVER_LAZ_URI = DEFAULT_LIDAR_LAZ_URI
 
 POINT_CLOUD_LIST_PREFIX_GS = "gs://amazon-revealed/Point-Cloud"
 POINT_CLOUD_MAX_LAZ_BYTES = 50 * 1024 * 1024
@@ -125,6 +127,40 @@ def list_point_cloud_laz_catalog() -> list[tuple[str, int]]:
 
 def _format_size_mb(size_bytes: int) -> str:
     return f"{size_bytes / (1024 * 1024):.2f} MB"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _gcs_file_size_bytes(gs_uri: str) -> int:
+    client = _build_storage_client()
+    return client.gcs_object_size_bytes(_normalize_storage_path(gs_uri))
+
+
+def _catalog_with_cover_first(
+    entries: list[tuple[str, int]],
+    cover_uri: str,
+) -> list[tuple[str, int]]:
+    """
+    Put the cover URI first (default selection). De-duplicate; trim to POINT_CLOUD_LIST_LIMIT.
+    If the cover is not in the catalog list (e.g. size filter), size is fetched via GCS metadata.
+    """
+    cover_norm = _normalize_storage_path(cover_uri.strip())
+    rest = [
+        (u, s)
+        for u, s in entries
+        if _normalize_storage_path(u) != cover_norm
+    ]
+    size_cover: int | None = None
+    for u, s in entries:
+        if _normalize_storage_path(u) == cover_norm:
+            size_cover = s
+            break
+    if size_cover is None:
+        try:
+            size_cover = _gcs_file_size_bytes(cover_norm)
+        except Exception:
+            size_cover = 0
+    ordered = [(cover_norm, size_cover)] + rest
+    return ordered[:POINT_CLOUD_LIST_LIMIT]
 
 
 def _df_from_remote_laz_pipeline(
@@ -351,6 +387,7 @@ with tab_3d:
             except Exception as exc:
                 st.error(f"Erro ao listar {POINT_CLOUD_LIST_PREFIX_GS}: {exc}")
                 st.stop()
+            entries = _catalog_with_cover_first(entries, POINT_CLOUD_COVER_LAZ_URI)
             if not entries:
                 st.warning(
                     f"Nenhum arquivo .laz/.las até 50 MB em {POINT_CLOUD_LIST_PREFIX_GS}/ "
@@ -361,10 +398,15 @@ with tab_3d:
             laz_uri = st.selectbox(
                 "Arquivo LAZ",
                 options=list(by_uri.keys()),
-                format_func=lambda u: f"{u.rsplit('/', 1)[-1]} — {_format_size_mb(by_uri[u])}",
+                index=0,
+                format_func=lambda u: (
+                    f"★ {u.rsplit('/', 1)[-1]} — {_format_size_mb(by_uri[u])}"
+                    if _normalize_storage_path(u) == _normalize_storage_path(POINT_CLOUD_COVER_LAZ_URI)
+                    else f"{u.rsplit('/', 1)[-1]} — {_format_size_mb(by_uri[u])}"
+                ),
                 help=(
-                    f"Até {POINT_CLOUD_LIST_LIMIT} arquivos de até 50 MB, "
-                    "do maior para o menor."
+                    f"Primeiro item: capa (padrão). Até {POINT_CLOUD_LIST_LIMIT} arquivos "
+                    "de até 50 MB (exceto a capa, sempre listada), do maior para o menor."
                 ),
             )
             force_laz_sync = st.checkbox(
@@ -416,7 +458,12 @@ with tab_3d:
 
         st.caption(f"Fonte ativa: {source_label}")
         color_by   = st.selectbox("Colorir por", ["z", "intensity", "classification", "return_number"])
-        colorscale = st.selectbox("Paleta de cores", ["Viridis", "Plasma", "Inferno", "RdYlGn", "Turbo"])
+        colorscale = st.selectbox(
+            "Paleta de cores",
+            ["Viridis", "Plasma", "Inferno", "RdYlGn", "Turbo"],
+            index=2,
+            help="Default: Inferno.",
+        )
         point_size = st.slider("Tamanho do ponto", 1, 5, 2)
 
         st.divider()
