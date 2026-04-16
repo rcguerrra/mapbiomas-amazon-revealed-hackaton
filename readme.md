@@ -1,0 +1,1 @@
+python -m src.console storage download gs://amazon-revealed/Point-Cloud/01_ENTREGA_23_08_2023/NP/ACRE_005_NP_8973-536.laz

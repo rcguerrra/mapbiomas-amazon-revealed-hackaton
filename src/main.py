@@ -1,14 +1,22 @@
 import glob
 import json
+import os
 import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly import colors as pcolors
-import rasterio
 import streamlit as st
 import streamlit.components.v1 as components
+from dotenv import load_dotenv
+
+BQ_PROJECT = "mapbiomas"
+BQ_TABLE = "mapbiomas.mapbiomas_lidar.amazonia_3d"
+
+load_dotenv()
+if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 SCALE = 0.001  # LAS default scale factor
 
@@ -34,14 +42,61 @@ def sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
 
 
 @st.cache_data
-def load_tif(path: str):
-    with rasterio.open(path) as src:
-        band = src.read(1).astype(float)
-        nodata = src.nodata
-        bounds = src.bounds
-    if nodata is not None:
-        band[band == nodata] = np.nan
-    return band, bounds
+def load_bigquery_table(project: str, table: str, limit: int) -> pd.DataFrame:
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=project)
+    query = f"SELECT * FROM `{table}` LIMIT {int(limit)}"
+    df = client.query(query).result().to_dataframe()
+
+    cols = {c.lower(): c for c in df.columns}
+
+    # Accept common schemas:
+    # - X,Y,Z (LAS-style integer/scaled)
+    # - x,y,z
+    # - longitude,latitude,elevacao_z (this BigQuery table)
+    if "longitude" in cols and "latitude" in cols and "elevacao_z" in cols:
+        df["x"] = df[cols["longitude"]].astype(float)
+        df["y"] = df[cols["latitude"]].astype(float)
+        df["z"] = df[cols["elevacao_z"]].astype(float)
+    elif "x" in cols and "y" in cols and "z" in cols:
+        x_raw = df[cols["x"]].astype(float)
+        y_raw = df[cols["y"]].astype(float)
+        z_raw = df[cols["z"]].astype(float)
+
+        if np.nanmax(np.abs(x_raw.to_numpy())) > 10000:
+            df["x"] = x_raw * SCALE
+            df["y"] = y_raw * SCALE
+            df["z"] = z_raw * SCALE
+        else:
+            df["x"] = x_raw
+            df["y"] = y_raw
+            df["z"] = z_raw
+    else:
+        raise ValueError(
+            "BigQuery table must contain one of: "
+            "(X,Y,Z), (x,y,z), or (longitude,latitude,elevacao_z)."
+        )
+
+    if "intensity" not in cols:
+        if "intensity" not in df.columns:
+            df["intensity"] = 0
+    else:
+        df["intensity"] = df[cols["intensity"]]
+
+    if "classification" not in cols:
+        if "classification" not in df.columns:
+            df["classification"] = 0
+    else:
+        df["classification"] = df[cols["classification"]]
+
+    if "return_number" not in cols:
+        if "return_number" not in df.columns:
+            df["return_number"] = 1
+    else:
+        df["return_number"] = df[cols["return_number"]]
+
+    return df
 
 
 @st.cache_data
@@ -99,15 +154,32 @@ def prepare_map_points(
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_3d:
     parquet_files = sorted(glob.glob("./data/*.parquet"))
-    if not parquet_files:
-        st.info("Nenhum arquivo .parquet encontrado em data/.")
-        st.stop()
 
     with st.sidebar:
         st.header("Visualização 3D")
-        selected_parquet = st.selectbox("Arquivo Parquet", parquet_files)
-        df_full = load_parquet(selected_parquet)
-        n_points   = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
+        data_source = st.selectbox("Fonte", ["Parquet local", "BigQuery"])
+        n_points = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
+
+        if data_source == "Parquet local":
+            if not parquet_files:
+                st.info("Nenhum arquivo .parquet encontrado em data/.")
+                st.stop()
+            selected_parquet = st.selectbox("Arquivo Parquet", parquet_files)
+            df_full = load_parquet(selected_parquet)
+            source_label = selected_parquet
+        else:
+            try:
+                df_full = load_bigquery_table(BQ_PROJECT, BQ_TABLE, n_points)
+            except Exception as exc:
+                st.error(f"Erro ao carregar BigQuery: {exc}")
+                st.stop()
+            source_label = f"{BQ_TABLE} (limit {n_points:,})"
+
+        if df_full.empty:
+            st.warning("A fonte selecionada não retornou dados.")
+            st.stop()
+
+        st.caption(f"Fonte ativa: {source_label}")
         color_by   = st.selectbox("Colorir por", ["z", "intensity", "classification", "return_number"])
         colorscale = st.selectbox("Paleta de cores", ["Viridis", "Plasma", "Inferno", "RdYlGn", "Turbo"])
         point_size = st.slider("Tamanho do ponto", 1, 5, 2)
@@ -169,43 +241,6 @@ with tab_3d:
         with col_b:
             st.subheader("Pontos por classe")
             st.bar_chart(df["classification"].value_counts().sort_index())
-
-
-# # ══════════════════════════════════════════════════════════════════════════════
-# # ABA 2 — GeoTIFF (desativada)
-# # ══════════════════════════════════════════════════════════════════════════════
-# with tab_tif:
-#     tif_files = sorted(glob.glob("./data/*.tif"))
-#
-#     if not tif_files:
-#         st.info("Nenhum GeoTIFF encontrado em data/. Gere um com:\n\n"
-#                 "`python -m src.console lidar parquet-to-tif data/<file>.parquet`")
-#     else:
-#         selected_tif = st.selectbox("Arquivo GeoTIFF", tif_files)
-#         tif_colorscale = st.selectbox("Paleta", ["Viridis", "Plasma", "Inferno", "RdYlGn", "Turbo"], key="tif_cs")
-#
-#         band, bounds = load_tif(selected_tif)
-#
-#         c1, c2, c3, c4 = st.columns(4)
-#         valid = band[~np.isnan(band)]
-#         c1.metric("Linhas × Colunas", f"{band.shape[0]} × {band.shape[1]}")
-#         c2.metric("Mín", f"{valid.min():.2f}" if len(valid) else "—")
-#         c3.metric("Máx", f"{valid.max():.2f}" if len(valid) else "—")
-#         c4.metric("Média", f"{valid.mean():.2f}" if len(valid) else "—")
-#
-#         fig_tif = go.Figure(go.Heatmap(
-#             z=band,
-#             colorscale=tif_colorscale,
-#             colorbar=dict(title="valor"),
-#             hoverongaps=False,
-#         ))
-#         fig_tif.update_layout(
-#             xaxis=dict(title="coluna", scaleanchor="y"),
-#             yaxis=dict(title="linha", autorange="reversed"),
-#             margin=dict(l=0, r=0, t=0, b=0),
-#             height=600,
-#         )
-#         st.plotly_chart(fig_tif, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

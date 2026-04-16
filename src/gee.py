@@ -12,6 +12,7 @@ from . import config
 def _resolve_credentials_path(credentials_path: Optional[Union[str, Path]] = None) -> Path:
     env_path = (
         credentials_path
+        or config.GOOGLE_APPLICATION_CREDENTIALS
         or config.MBENGINE_GCP_SERVICE_ACCOUNT
         or "credentials/mapbiomas-workspace-10-gee.json"
     )
@@ -19,7 +20,7 @@ def _resolve_credentials_path(credentials_path: Optional[Union[str, Path]] = Non
     if not path.exists():
         raise FileNotFoundError(
             f"GEE credentials file not found: {path}. "
-            "Set MBENGINE_GCP_SERVICE_ACCOUNT in .env or pass credentials_path."
+            "Set GOOGLE_APPLICATION_CREDENTIALS in .env or pass credentials_path."
         )
     return path
 

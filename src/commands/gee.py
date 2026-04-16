@@ -39,11 +39,11 @@ def init(
 
 @app.command(help="Show current configured credential path.")
 def status():
-    configured = config.MBENGINE_GCP_SERVICE_ACCOUNT
+    configured = config.GOOGLE_APPLICATION_CREDENTIALS or config.MBENGINE_GCP_SERVICE_ACCOUNT
     if configured:
-        console.print(f"[blue]MBENGINE_GCP_SERVICE_ACCOUNT:[/blue] {configured}")
+        console.print(f"[blue]GOOGLE_APPLICATION_CREDENTIALS:[/blue] {configured}")
     else:
         console.print(
-            "[yellow]MBENGINE_GCP_SERVICE_ACCOUNT is not set. "
+            "[yellow]GOOGLE_APPLICATION_CREDENTIALS is not set. "
             "Using default path in src.gee._resolve_credentials_path().[/yellow]"
         )

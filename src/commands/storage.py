@@ -17,8 +17,9 @@ app = typer.Typer(help="Storage helpers (local, S3, GCS) via StorageClient")
 def _resolve_gcp_credentials(credentials_path: Optional[str]) -> Optional[str]:
     return (
         credentials_path
+        or config.GOOGLE_APPLICATION_CREDENTIALS
         or config.MBENGINE_GCP_SERVICE_ACCOUNT
-        or os.getenv("GCP_PKEY")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     )
 
 

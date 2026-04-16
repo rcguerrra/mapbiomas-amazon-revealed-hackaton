@@ -15,3 +15,5 @@ pyarrow
 streamlit
 plotly
 rasterio
+google-cloud-bigquery
+db-dtypes
