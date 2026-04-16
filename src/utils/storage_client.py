@@ -2,7 +2,7 @@ import re
 import logging
 import json
 import pandas as pd
-from typing import List, Optional, Union, Dict, Any
+from typing import Any, Dict, List, Optional, Union
 import fsspec
 import boto3
 from botocore.exceptions import ClientError
@@ -19,7 +19,7 @@ class StorageClient:
 
     def __init__(
         self,
-        gcp_credentials: Optional[str] = None,
+        gcp_credentials: Optional[Union[str, Dict[str, Any]]] = None,
         aws_key_id: Optional[str] = None,
         aws_secret: Optional[str] = None,
         aws_region: Optional[str] = None,
@@ -28,7 +28,8 @@ class StorageClient:
         Inicializa o StorageClient com credenciais opcionais para S3 e GCS.
 
         Args:
-            gcp_credentials (str): Caminho para o arquivo JSON de credenciais do GCS.
+            gcp_credentials: Path to a service account JSON file, inline JSON string,
+                or a dict (e.g. from env on Streamlit Cloud).
             aws_key_id (str): AWS Access Key ID.
             aws_secret (str): AWS Secret Access Key.
             aws_region (str): Região da AWS (ex.: 'us-east-1').
@@ -43,11 +44,17 @@ class StorageClient:
         else:
             self.s3_kwargs = {}
 
-        # Configurações do GCS
-        if gcp_credentials:
+        # GCS: gcsfs accepts a file path, JSON string, or credentials dict.
+        if gcp_credentials is None:
+            self.gcs_kwargs = {}
+        elif isinstance(gcp_credentials, dict):
             self.gcs_kwargs = {"token": gcp_credentials}
         else:
-            self.gcs_kwargs = {}
+            s = str(gcp_credentials).strip()
+            if s.startswith("{"):
+                self.gcs_kwargs = {"token": json.loads(s)}
+            else:
+                self.gcs_kwargs = {"token": s}
 
     def _get_fs(self, path: str):
         """

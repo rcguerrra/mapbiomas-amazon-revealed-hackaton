@@ -2,6 +2,7 @@ import glob
 import json
 import os
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -11,12 +12,33 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
+from config import load_gcp_service_account_dict
+from lidar import laz_to_parquet
+from utils.storage_client import StorageClient
+
 BQ_PROJECT = "mapbiomas"
 BQ_TABLE = "mapbiomas.mapbiomas_lidar.amazonia_3d"
 
 load_dotenv()
-if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+
+def _sync_streamlit_secrets_to_environ() -> None:
+    """Expose Streamlit Cloud / secrets.toml keys as env vars for credential loaders."""
+    try:
+        if hasattr(st, "secrets"):
+            for key in (
+                "GCP_SERVICE_ACCOUNT_JSON",
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "MBENGINE_GCP_SERVICE_ACCOUNT",
+            ):
+                if key in st.secrets:
+                    os.environ[key] = str(st.secrets[key])
+    except Exception:
+        pass
+
+
+_sync_streamlit_secrets_to_environ()
 
 SCALE = 0.001  # LAS default scale factor
 
@@ -27,43 +49,64 @@ tab_3d, tab_map = st.tabs(["Nuvem de pontos 3D", "MapLibre"])
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-@st.cache_data
-def load_parquet(path: str) -> pd.DataFrame:
-    df = pd.read_parquet(path)
-    df["x"] = df["X"] * SCALE
-    df["y"] = df["Y"] * SCALE
-    df["z"] = df["Z"] * SCALE
-    return df
+def _normalize_storage_path(path: str) -> str:
+    if path.startswith("gcs://"):
+        return "gs://" + path[len("gcs://") :]
+    return path
 
 
-@st.cache_data
-def sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
-    return df.sample(min(n, len(df)), random_state=42).reset_index(drop=True)
+def _build_storage_client() -> StorageClient:
+    return StorageClient(gcp_credentials=load_gcp_service_account_dict())
 
 
-@st.cache_data
-def load_bigquery_table(project: str, table: str, limit: int) -> pd.DataFrame:
-    from google.cloud import bigquery
+def ensure_local_parquet_from_remote_laz(
+    remote_uri: str,
+    *,
+    force_download: bool = False,
+) -> Path:
+    """
+    Download LAZ/LAS from gs:// or s3:// into data/ when needed, convert to Parquet,
+    and return the local Parquet path.
+    """
+    remote = _normalize_storage_path(remote_uri.strip())
+    if not remote.startswith(("gs://", "s3://")):
+        raise ValueError("LAZ URI must start with gs:// or s3://.")
 
-    client = bigquery.Client(project=project)
-    query = f"SELECT * FROM `{table}` LIMIT {int(limit)}"
-    df = client.query(query).result().to_dataframe()
+    client = _build_storage_client()
+    if not client.exists(remote):
+        raise FileNotFoundError(f"Remote file not found: {remote}")
 
+    filename = remote.rstrip("/").rsplit("/", 1)[-1]
+    if not filename:
+        raise ValueError("Could not infer filename from URI.")
+
+    data_dir = Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    local_laz = data_dir / filename
+    local_parquet = data_dir / f"{Path(filename).stem}.parquet"
+
+    if force_download or not local_laz.is_file():
+        local_laz.write_bytes(client.read(remote))
+
+    need_convert = not local_parquet.is_file()
+    if local_laz.is_file() and local_parquet.is_file():
+        if local_laz.stat().st_mtime > local_parquet.stat().st_mtime:
+            need_convert = True
+
+    if need_convert:
+        laz_to_parquet(str(local_laz), local_parquet)
+
+    load_parquet.clear()
+    return local_parquet
+
+
+def _standardize_point_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = {c.lower(): c for c in df.columns}
 
-    # Accept common schemas:
-    # - X,Y,Z (LAS-style integer/scaled)
-    # - x,y,z
-    # - longitude,latitude,elevacao_z (this BigQuery table)
-    if "longitude" in cols and "latitude" in cols and "elevacao_z" in cols:
-        df["x"] = df[cols["longitude"]].astype(float)
-        df["y"] = df[cols["latitude"]].astype(float)
-        df["z"] = df[cols["elevacao_z"]].astype(float)
-    elif "x" in cols and "y" in cols and "z" in cols:
+    if "x" in cols and "y" in cols and "z" in cols:
         x_raw = df[cols["x"]].astype(float)
         y_raw = df[cols["y"]].astype(float)
         z_raw = df[cols["z"]].astype(float)
-
         if np.nanmax(np.abs(x_raw.to_numpy())) > 10000:
             df["x"] = x_raw * SCALE
             df["y"] = y_raw * SCALE
@@ -72,10 +115,14 @@ def load_bigquery_table(project: str, table: str, limit: int) -> pd.DataFrame:
             df["x"] = x_raw
             df["y"] = y_raw
             df["z"] = z_raw
+    elif "longitude" in cols and "latitude" in cols and "elevacao_z" in cols:
+        df["x"] = df[cols["longitude"]].astype(float)
+        df["y"] = df[cols["latitude"]].astype(float)
+        df["z"] = df[cols["elevacao_z"]].astype(float)
     else:
         raise ValueError(
-            "BigQuery table must contain one of: "
-            "(X,Y,Z), (x,y,z), or (longitude,latitude,elevacao_z)."
+            "Dataset must contain one of: (X,Y,Z), (x,y,z), or "
+            "(longitude,latitude,elevacao_z)."
         )
 
     if "intensity" not in cols:
@@ -97,6 +144,35 @@ def load_bigquery_table(project: str, table: str, limit: int) -> pd.DataFrame:
         df["return_number"] = df[cols["return_number"]]
 
     return df
+
+
+@st.cache_data
+def load_parquet(path: str) -> pd.DataFrame:
+    normalized_path = _normalize_storage_path(path)
+    df = pd.read_parquet(normalized_path)
+    return _standardize_point_columns(df)
+
+
+@st.cache_data
+def sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    return df.sample(min(n, len(df)), random_state=42).reset_index(drop=True)
+
+
+@st.cache_data
+def load_bigquery_table(project: str, table: str, limit: int) -> pd.DataFrame:
+    from google.cloud import bigquery
+    from google.oauth2 import service_account
+
+    info = load_gcp_service_account_dict()
+    if info is not None:
+        creds = service_account.Credentials.from_service_account_info(info)
+        client = bigquery.Client(project=project, credentials=creds)
+    else:
+        client = bigquery.Client(project=project)
+    query = f"SELECT * FROM `{table}` LIMIT {int(limit)}"
+    df = client.query(query).result().to_dataframe()
+
+    return _standardize_point_columns(df)
 
 
 @st.cache_data
@@ -157,16 +233,87 @@ with tab_3d:
 
     with st.sidebar:
         st.header("Visualização 3D")
-        data_source = st.selectbox("Fonte", ["Parquet local", "BigQuery"])
+        data_source = st.selectbox(
+            "Fonte",
+            [
+                "LAZ na Storage (download + Parquet)",
+                "Parquet local",
+                "Parquet na Storage (gs://, s3://)",
+                "BigQuery",
+            ],
+        )
         n_points = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
 
-        if data_source == "Parquet local":
+        if data_source == "LAZ na Storage (download + Parquet)":
+            default_laz_uri = os.getenv("LIDAR_LAZ_URI", "")
+            laz_uri = st.text_input(
+                "URI do LAZ",
+                value=default_laz_uri,
+                placeholder="gs://bucket/path/arquivo.laz",
+                help="The object must exist on storage. It is saved under data/ and converted to Parquet for the viewer.",
+            ).strip()
+            force_laz_sync = st.checkbox(
+                "Force re-download and re-convert",
+                value=False,
+                help="Ignore cached local LAZ/Parquet for this URI and sync again from storage.",
+            )
+            if not laz_uri:
+                st.info("Informe a URI do arquivo .laz na storage (gs:// ou s3://).")
+                st.stop()
+
+            uri_norm = _normalize_storage_path(laz_uri)
+            prep_key = (uri_norm, force_laz_sync)
+            if (
+                force_laz_sync
+                or st.session_state.get("laz_storage_prep_key") != prep_key
+            ):
+                try:
+                    with st.spinner("Checking storage, downloading LAZ if needed, converting to Parquet…"):
+                        parquet_path = ensure_local_parquet_from_remote_laz(
+                            laz_uri, force_download=force_laz_sync
+                        )
+                except Exception as exc:
+                    st.error(f"Erro ao sincronizar LAZ / Parquet: {exc}")
+                    st.stop()
+                st.session_state["laz_storage_prep_key"] = prep_key
+                st.session_state["laz_storage_parquet_path"] = str(parquet_path)
+            else:
+                parquet_path = Path(st.session_state["laz_storage_parquet_path"])
+
+            try:
+                df_full = load_parquet(str(parquet_path))
+            except Exception as exc:
+                st.error(f"Erro ao carregar Parquet: {exc}")
+                st.stop()
+            source_label = f"{uri_norm} → {parquet_path}"
+        elif data_source == "Parquet local":
             if not parquet_files:
                 st.info("Nenhum arquivo .parquet encontrado em data/.")
                 st.stop()
             selected_parquet = st.selectbox("Arquivo Parquet", parquet_files)
-            df_full = load_parquet(selected_parquet)
+            try:
+                df_full = load_parquet(selected_parquet)
+            except Exception as exc:
+                st.error(f"Erro ao carregar Parquet local: {exc}")
+                st.stop()
             source_label = selected_parquet
+        elif data_source == "Parquet na Storage (gs://, s3://)":
+            default_storage_uri = os.getenv("LIDAR_PARQUET_URI", "")
+            storage_parquet_uri = st.text_input(
+                "URI do Parquet",
+                value=default_storage_uri,
+                placeholder="gs://bucket/pasta/arquivo.parquet",
+                help="Suporta gs://, gcs:// e s3://.",
+            ).strip()
+            if not storage_parquet_uri:
+                st.info("Informe a URI do parquet na storage.")
+                st.stop()
+            try:
+                df_full = load_parquet(storage_parquet_uri)
+            except Exception as exc:
+                st.error(f"Erro ao carregar Parquet na storage: {exc}")
+                st.stop()
+            source_label = _normalize_storage_path(storage_parquet_uri)
         else:
             try:
                 df_full = load_bigquery_table(BQ_PROJECT, BQ_TABLE, n_points)

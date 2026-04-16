@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -14,13 +13,10 @@ console = Console()
 app = typer.Typer(help="Storage helpers (local, S3, GCS) via StorageClient")
 
 
-def _resolve_gcp_credentials(credentials_path: Optional[str]) -> Optional[str]:
-    return (
-        credentials_path
-        or config.GOOGLE_APPLICATION_CREDENTIALS
-        or config.MBENGINE_GCP_SERVICE_ACCOUNT
-        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    )
+def _resolve_gcp_credentials(credentials_path: Optional[str]):
+    if credentials_path:
+        return credentials_path
+    return config.load_gcp_service_account_dict()
 
 
 def _build_client(
@@ -125,3 +121,52 @@ def download(
     content = client.read(source_path)
     destination.write_bytes(content)
     console.print(f"[green]Downloaded:[/green] {source_path} -> {destination}")
+
+
+@app.command(help="Read file content directly from storage (s3:// or gs://).")
+def read(
+    source_path: str = typer.Argument(
+        ..., help="Source file path (s3://, gs://, gcs://, or local)."
+    ),
+    output_path: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Optional local output path for raw bytes."
+    ),
+    encoding: str = typer.Option(
+        "utf-8", "--encoding", "-e", help="Text encoding when printing to stdout."
+    ),
+    max_chars: int = typer.Option(
+        20000, "--max-chars", help="Maximum number of characters to print."
+    ),
+    credentials_path: Optional[str] = typer.Option(None, "--credentials-path", "-c"),
+    aws_key_id: Optional[str] = typer.Option(None, "--aws-key-id"),
+    aws_secret: Optional[str] = typer.Option(None, "--aws-secret"),
+    aws_region: Optional[str] = typer.Option(None, "--aws-region"),
+):
+    client = _build_client(credentials_path, aws_key_id, aws_secret, aws_region)
+    source_path = _normalize_path(source_path)
+    content = client.read(source_path)
+
+    if output_path:
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        console.print(f"[green]Saved:[/green] {source_path} -> {destination}")
+        return
+
+    try:
+        text = content.decode(encoding)
+    except UnicodeDecodeError:
+        raise typer.BadParameter(
+            "Could not decode file as text with selected encoding. "
+            "Use --output to save raw bytes locally."
+        )
+
+    if max_chars > 0 and len(text) > max_chars:
+        text = text[:max_chars]
+        console.print(text)
+        console.print(
+            f"\n[yellow]Output truncated to {max_chars} characters. "
+            "Use --max-chars to increase.[/yellow]"
+        )
+    else:
+        console.print(text)
