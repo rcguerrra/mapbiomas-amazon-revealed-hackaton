@@ -20,8 +20,7 @@ DEFAULT_LIDAR_LAZ_URI = (
 )
 
 POINT_CLOUD_LIST_PREFIX_GS = "gs://amazon-revealed/Point-Cloud"
-POINT_CLOUD_MIN_LAZ_BYTES = 50 * 1024 * 1024
-POINT_CLOUD_MAX_LAZ_BYTES = 100 * 1024 * 1024
+POINT_CLOUD_MAX_LAZ_BYTES = 50 * 1024 * 1024
 POINT_CLOUD_LIST_LIMIT = 100
 
 load_dotenv()
@@ -116,7 +115,7 @@ def list_point_cloud_laz_catalog() -> list[tuple[str, int]]:
     client = _build_storage_client()
     return client.list_gcs_files_filtered(
         POINT_CLOUD_LIST_PREFIX_GS,
-        min_size_bytes=POINT_CLOUD_MIN_LAZ_BYTES,
+        min_size_bytes=None,
         max_size_bytes=POINT_CLOUD_MAX_LAZ_BYTES,
         suffixes=(".laz", ".las"),
         sort_descending=True,
@@ -298,13 +297,13 @@ with tab_3d:
         data_source = st.selectbox(
             "Fonte",
             [
-                "Point-Cloud em gs://amazon-revealed (50–100 MB)",
+                "Point-Cloud em gs://amazon-revealed (até 50 MB)",
                 "LAZ na Storage (URI manual)",
             ],
         )
         n_points = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
 
-        if data_source == "Point-Cloud em gs://amazon-revealed (50–100 MB)":
+        if data_source == "Point-Cloud em gs://amazon-revealed (até 50 MB)":
             try:
                 entries = list_point_cloud_laz_catalog()
             except Exception as exc:
@@ -312,7 +311,7 @@ with tab_3d:
                 st.stop()
             if not entries:
                 st.warning(
-                    f"Nenhum arquivo .laz/.las entre 50 e 100 MB em {POINT_CLOUD_LIST_PREFIX_GS}/ "
+                    f"Nenhum arquivo .laz/.las até 50 MB em {POINT_CLOUD_LIST_PREFIX_GS}/ "
                     "(listagem recursiva)."
                 )
                 st.stop()
@@ -322,7 +321,7 @@ with tab_3d:
                 options=list(by_uri.keys()),
                 format_func=lambda u: f"{u.rsplit('/', 1)[-1]} — {_format_size_mb(by_uri[u])}",
                 help=(
-                    f"Até {POINT_CLOUD_LIST_LIMIT} arquivos entre 50 e 100 MB, "
+                    f"Até {POINT_CLOUD_LIST_LIMIT} arquivos de até 50 MB, "
                     "do maior para o menor."
                 ),
             )
