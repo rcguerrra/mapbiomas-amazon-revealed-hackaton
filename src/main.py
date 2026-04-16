@@ -54,7 +54,7 @@ _sync_streamlit_secrets_to_environ()
 SCALE = 0.001  # LAS default scale factor
 
 st.set_page_config(page_title="LiDAR Explorer", layout="wide")
-st.title("LiDAR Explorer — ACRE")
+st.title("LiDAR Explorer")
 
 tab_3d, tab_map = st.tabs(["Nuvem de pontos 3D", "MapLibre"])
 
