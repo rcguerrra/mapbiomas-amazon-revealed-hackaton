@@ -23,6 +23,7 @@ credentials/*
 !credentials/.gitkeep
 *.pem
 *.key
+.streamlit/secrets.toml
 
 # Local data artifacts
 data/*

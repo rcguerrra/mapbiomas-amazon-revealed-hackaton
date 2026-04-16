@@ -19,6 +19,10 @@ from utils.storage_client import StorageClient
 BQ_PROJECT = "mapbiomas"
 BQ_TABLE = "mapbiomas.mapbiomas_lidar.amazonia_3d"
 
+DEFAULT_LIDAR_LAZ_URI = (
+    "gs://amazon-revealed/Point-Cloud/01_ENTREGA_23_08_2023/NP/ACRE_005_NP_8973-536.laz"
+)
+
 load_dotenv()
 
 
@@ -33,7 +37,8 @@ def _sync_streamlit_secrets_to_environ() -> None:
                 "MBENGINE_GCP_SERVICE_ACCOUNT",
             ):
                 if key in st.secrets:
-                    os.environ[key] = str(st.secrets[key])
+                    value = st.secrets[key]
+                    os.environ[key] = json.dumps(value) if isinstance(value, dict) else str(value)
     except Exception:
         pass
 
@@ -245,7 +250,7 @@ with tab_3d:
         n_points = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
 
         if data_source == "LAZ na Storage (download + Parquet)":
-            default_laz_uri = os.getenv("LIDAR_LAZ_URI", "")
+            default_laz_uri = os.getenv("LIDAR_LAZ_URI", DEFAULT_LIDAR_LAZ_URI)
             laz_uri = st.text_input(
                 "URI do LAZ",
                 value=default_laz_uri,
@@ -257,28 +262,49 @@ with tab_3d:
                 value=False,
                 help="Ignore cached local LAZ/Parquet for this URI and sync again from storage.",
             )
+            load_laz_clicked = st.button(
+                "Carregar arquivo",
+                type="primary",
+                use_container_width=True,
+                help="Download from storage (if needed) and convert to Parquet before viewing.",
+            )
             if not laz_uri:
                 st.info("Informe a URI do arquivo .laz na storage (gs:// ou s3://).")
                 st.stop()
 
             uri_norm = _normalize_storage_path(laz_uri)
-            prep_key = (uri_norm, force_laz_sync)
-            if (
-                force_laz_sync
-                or st.session_state.get("laz_storage_prep_key") != prep_key
-            ):
+            loaded_uri = st.session_state.get("laz_loaded_uri_norm")
+            parquet_cached = st.session_state.get("laz_storage_parquet_path")
+
+            if loaded_uri != uri_norm and not load_laz_clicked:
+                st.info(
+                    "Clique em **Carregar arquivo** para baixar da storage e converter para Parquet."
+                )
+                st.stop()
+
+            reuse_local_parquet = (
+                loaded_uri == uri_norm
+                and parquet_cached
+                and Path(parquet_cached).is_file()
+                and not force_laz_sync
+                and not load_laz_clicked
+            )
+
+            if reuse_local_parquet:
+                parquet_path = Path(parquet_cached)
+            else:
                 try:
-                    with st.spinner("Checking storage, downloading LAZ if needed, converting to Parquet…"):
+                    with st.spinner(
+                        "Checking storage, downloading LAZ if needed, converting to Parquet…"
+                    ):
                         parquet_path = ensure_local_parquet_from_remote_laz(
                             laz_uri, force_download=force_laz_sync
                         )
                 except Exception as exc:
                     st.error(f"Erro ao sincronizar LAZ / Parquet: {exc}")
                     st.stop()
-                st.session_state["laz_storage_prep_key"] = prep_key
+                st.session_state["laz_loaded_uri_norm"] = uri_norm
                 st.session_state["laz_storage_parquet_path"] = str(parquet_path)
-            else:
-                parquet_path = Path(st.session_state["laz_storage_parquet_path"])
 
             try:
                 df_full = load_parquet(str(parquet_path))

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
@@ -12,6 +13,35 @@ GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 MBENGINE_GCP_SERVICE_ACCOUNT = (
     os.getenv("MBENGINE_GCP_SERVICE_ACCOUNT") or GOOGLE_APPLICATION_CREDENTIALS
 )
+
+
+def _normalize_multiline_private_key(raw_json: str) -> str:
+    """
+    Normalize invalid literal line breaks inside JSON private_key values.
+
+    Some deployments paste service-account JSON with real newlines in private_key.
+    JSON requires escaped newlines (\\n), otherwise json.loads raises
+    "Invalid control character".
+    """
+    pattern = r'("private_key"\s*:\s*")(.*?)(")'
+
+    def _replace(match: re.Match[str]) -> str:
+        value = match.group(2)
+        value = value.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+        return f'{match.group(1)}{value}{match.group(3)}'
+
+    return re.sub(pattern, _replace, raw_json, flags=re.DOTALL)
+
+
+def _parse_service_account_json(raw: str) -> Dict[str, Any]:
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        normalized = _normalize_multiline_private_key(raw)
+        if normalized == raw:
+            raise exc
+        return json.loads(normalized)
 
 
 def load_gcp_service_account_dict() -> Optional[Dict[str, Any]]:
@@ -27,7 +57,7 @@ def load_gcp_service_account_dict() -> Optional[Dict[str, Any]]:
     for env_key in ("GCP_SERVICE_ACCOUNT_JSON", "GOOGLE_APPLICATION_CREDENTIALS_JSON"):
         raw = os.getenv(env_key)
         if raw and raw.strip():
-            return json.loads(raw.strip())
+            return _parse_service_account_json(raw)
 
     for env_key in ("GOOGLE_APPLICATION_CREDENTIALS", "MBENGINE_GCP_SERVICE_ACCOUNT"):
         raw = os.getenv(env_key)
@@ -35,7 +65,7 @@ def load_gcp_service_account_dict() -> Optional[Dict[str, Any]]:
             continue
         raw = raw.strip()
         if raw.startswith("{"):
-            return json.loads(raw)
+            return _parse_service_account_json(raw)
         if os.path.isfile(raw):
             with open(raw, encoding="utf-8") as f:
                 return json.load(f)
