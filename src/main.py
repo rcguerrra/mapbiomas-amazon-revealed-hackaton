@@ -181,111 +181,153 @@ def _df_from_remote_laz_pipeline(
 
 
 def _standardize_point_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize coordinate/attribute columns and return a minimal DataFrame
+    with only the 6 columns needed for visualization, all in compact dtypes.
+    Avoids float64 and drops all unreferenced columns immediately.
+    """
     cols = {c.lower(): c for c in df.columns}
+    n = len(df)
 
     if "x" in cols and "y" in cols and "z" in cols:
-        x_raw = df[cols["x"]].astype(float)
-        y_raw = df[cols["y"]].astype(float)
-        z_raw = df[cols["z"]].astype(float)
-        if np.nanmax(np.abs(x_raw.to_numpy())) > 10000:
-            df["x"] = x_raw * SCALE
-            df["y"] = y_raw * SCALE
-            df["z"] = z_raw * SCALE
+        x_raw = df[cols["x"]].to_numpy(dtype=np.float64)
+        y_raw = df[cols["y"]].to_numpy(dtype=np.float64)
+        z_raw = df[cols["z"]].to_numpy(dtype=np.float64)
+        if np.nanmax(np.abs(x_raw)) > 10000:
+            x = (x_raw * SCALE).astype(np.float32)
+            y = (y_raw * SCALE).astype(np.float32)
+            z = (z_raw * SCALE).astype(np.float32)
         else:
-            df["x"] = x_raw
-            df["y"] = y_raw
-            df["z"] = z_raw
+            x = x_raw.astype(np.float32)
+            y = y_raw.astype(np.float32)
+            z = z_raw.astype(np.float32)
+        del x_raw, y_raw, z_raw
     elif "longitude" in cols and "latitude" in cols and "elevacao_z" in cols:
-        df["x"] = df[cols["longitude"]].astype(float)
-        df["y"] = df[cols["latitude"]].astype(float)
-        df["z"] = df[cols["elevacao_z"]].astype(float)
+        x = df[cols["longitude"]].to_numpy(dtype=np.float32)
+        y = df[cols["latitude"]].to_numpy(dtype=np.float32)
+        z = df[cols["elevacao_z"]].to_numpy(dtype=np.float32)
     else:
         raise ValueError(
             "Dataset must contain one of: (X,Y,Z), (x,y,z), or "
             "(longitude,latitude,elevacao_z)."
         )
 
-    if "intensity" not in cols:
-        if "intensity" not in df.columns:
-            df["intensity"] = 0
-    else:
-        df["intensity"] = df[cols["intensity"]]
+    intensity = (
+        df[cols["intensity"]].to_numpy(dtype=np.uint16)
+        if "intensity" in cols
+        else np.zeros(n, dtype=np.uint16)
+    )
+    classification = (
+        df[cols["classification"]].to_numpy(dtype=np.uint8)
+        if "classification" in cols
+        else np.zeros(n, dtype=np.uint8)
+    )
+    return_number = (
+        df[cols["return_number"]].to_numpy(dtype=np.uint8)
+        if "return_number" in cols
+        else np.ones(n, dtype=np.uint8)
+    )
 
-    if "classification" not in cols:
-        if "classification" not in df.columns:
-            df["classification"] = 0
-    else:
-        df["classification"] = df[cols["classification"]]
-
-    if "return_number" not in cols:
-        if "return_number" not in df.columns:
-            df["return_number"] = 1
-    else:
-        df["return_number"] = df[cols["return_number"]]
-
-    return df
+    return pd.DataFrame(
+        {"x": x, "y": y, "z": z,
+         "intensity": intensity,
+         "classification": classification,
+         "return_number": return_number},
+    )
 
 
-@st.cache_data
+def _select_parquet_columns(path: str) -> list[str] | None:
+    """Return only the columns needed for visualization; None means read all."""
+    try:
+        import pyarrow.parquet as pq
+        schema = pq.read_schema(path)
+        available = {c.lower(): c for c in schema.names}
+        needed: list[str] = []
+        # coordinate candidates
+        for name in ("x", "y", "z", "longitude", "latitude", "elevacao_z"):
+            if name in available:
+                needed.append(available[name])
+        for name in ("intensity", "classification", "return_number"):
+            if name in available:
+                needed.append(available[name])
+        return needed if needed else None
+    except Exception:
+        return None
+
+
+@st.cache_data(max_entries=1)
 def load_parquet(path: str) -> pd.DataFrame:
     normalized_path = _normalize_storage_path(path)
-    df = pd.read_parquet(normalized_path)
+    cols = _select_parquet_columns(normalized_path)
+    df = pd.read_parquet(normalized_path, columns=cols)
     return _standardize_point_columns(df)
 
 
-@st.cache_data
+@st.cache_data(max_entries=2)
 def sample(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.sample(min(n, len(df)), random_state=42).reset_index(drop=True)
 
 
-@st.cache_data
+@st.cache_data(max_entries=1)
 def prepare_map_points(
     df: pd.DataFrame, color_by: str, colorscale: str, z_exaggeration: float
-) -> tuple[list[dict], float, float]:
-    x = df["x"].astype(float).to_numpy()
-    y = df["y"].astype(float).to_numpy()
-    z = df["z"].astype(float).to_numpy()
+) -> tuple[str, float, float]:
+    """
+    Build a deck.gl-ready JSON string for the PointCloudLayer.
+    Returns (points_json, center_lon, center_lat).
+    Uses numpy throughout to avoid per-point Python objects.
+    """
+    x = df["x"].to_numpy(dtype=np.float32)
+    y = df["y"].to_numpy(dtype=np.float32)
+    z = df["z"].to_numpy(dtype=np.float32)
 
-    # If coordinates are already geographic, use them directly.
     is_geographic = (
-        np.nanmin(x) >= -180 and np.nanmax(x) <= 180 and np.nanmin(y) >= -90 and np.nanmax(y) <= 90
+        float(np.nanmin(x)) >= -180 and float(np.nanmax(x)) <= 180
+        and float(np.nanmin(y)) >= -90 and float(np.nanmax(y)) <= 90
     )
 
     if is_geographic:
         lon = x
         lat = y
     else:
-        # Fallback: treat XY as local metric coordinates and anchor in Acre.
         lon0 = -67.8
         lat0 = -9.8
         dx = x - np.nanmean(x)
         dy = y - np.nanmean(y)
-        lon = lon0 + (dx / (111320.0 * np.cos(np.radians(lat0))))
-        lat = lat0 + (dy / 110540.0)
+        lon = (lon0 + dx / (111320.0 * np.cos(np.radians(lat0)))).astype(np.float32)
+        lat = (lat0 + dy / 110540.0).astype(np.float32)
+        del dx, dy
 
     zmin = float(np.nanmin(z))
+    z_shifted = ((z - zmin) * z_exaggeration).astype(np.float32)
+    del z
 
-    c = df[color_by].astype(float).to_numpy()
+    c = df[color_by].to_numpy(dtype=np.float32)
     cmin = float(np.nanmin(c))
-    cmax = float(np.nanmax(c))
-    cspan = max(cmax - cmin, 1e-9)
-    cn = (c - cmin) / cspan
+    cspan = max(float(np.nanmax(c)) - cmin, 1e-9)
+    cn = ((c - cmin) / cspan).tolist()
+    del c
 
-    sampled_colors = pcolors.sample_colorscale(colorscale, cn.tolist())
+    sampled_colors = pcolors.sample_colorscale(colorscale, cn)
+    del cn
 
-    def _rgba_from_plotly(color: str) -> list[int]:
-        match = re.findall(r"[\d\.]+", color)
-        r, g, b = [int(float(v)) for v in match[:3]]
-        return [r, g, b, 180]
+    # Parse RGB values into a uint8 numpy array — avoids per-point Python dicts.
+    pattern = re.compile(r"[\d\.]+")
+    rgb = np.array(
+        [[int(float(v)) for v in pattern.findall(col)[:3]] for col in sampled_colors],
+        dtype=np.uint8,
+    )
+    del sampled_colors
 
-    points = [
-        {
-            "position": [float(lon_i), float(lat_i), float((z_i - zmin) * z_exaggeration)],
-            "color": _rgba_from_plotly(color_i),
-        }
-        for lon_i, lat_i, z_i, color_i in zip(lon, lat, z, sampled_colors)
+    # Build JSON string with vectorised string formatting.
+    rows = [
+        f'{{"position":[{lo:.6f},{la:.6f},{zs:.2f}],"color":[{r},{g},{b},180]}}'
+        for lo, la, zs, (r, g, b) in zip(lon, lat, z_shifted, rgb)
     ]
-    return points, float(np.nanmean(lon)), float(np.nanmean(lat))
+    points_json = "[" + ",".join(rows) + "]"
+    del rows, rgb, z_shifted
+
+    return points_json, float(np.nanmean(lon)), float(np.nanmean(lat))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -301,7 +343,7 @@ with tab_3d:
                 "LAZ na Storage (URI manual)",
             ],
         )
-        n_points = st.slider("Pontos amostrados", 10_000, 200_000, 50_000, step=10_000)
+        n_points = st.slider("Pontos amostrados", 5_000, 100_000, 30_000, step=5_000)
 
         if data_source == "Point-Cloud em gs://amazon-revealed (até 50 MB)":
             try:
@@ -448,8 +490,7 @@ with tab_map:
         st.warning("Nenhum ponto para desenhar no mapa com os filtros atuais.")
         st.stop()
 
-    points, center_lon, center_lat = prepare_map_points(df, color_by, colorscale, z_exaggeration)
-    points_json = json.dumps(points)
+    points_json, center_lon, center_lat = prepare_map_points(df, color_by, colorscale, z_exaggeration)
 
     map_html = """
     <!doctype html>
