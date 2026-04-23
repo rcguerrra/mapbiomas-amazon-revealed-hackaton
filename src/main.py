@@ -16,7 +16,8 @@ from lidar import laz_to_parquet
 from utils.storage_client import StorageClient
 
 DEFAULT_LIDAR_LAZ_URI = (
-    "gs://amazon-revealed/Point-Cloud/32_ENTREGA_17-12-2024/NP/MARAJO_009_NP_9892-684.laz"
+    "gs://amazon-revealed/Point-Cloud/01_ENTREGA_23_08_2023/NP/ACRE_005_NP_8976-536.laz"
+    #"gs://amazon-revealed/Point-Cloud/32_ENTREGA_17-12-2024/NP/MARAJO_009_NP_9892-684.laz"
 )
 
 POINT_CLOUD_COVER_LAZ_URI = DEFAULT_LIDAR_LAZ_URI
